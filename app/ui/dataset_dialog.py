@@ -62,7 +62,7 @@ class DatasetDialog(QDialog):
 
         intro = QLabel(
             "<b>Dataset configuration</b><br>"
-            "Choose the directories containing your <i>image volumes</i>, "
+            "Choose the directories containing your <i>preprocessed images</i>, "
             "<i>partial labels</i>, and the <i>output</i> folder for refined labels.")
         intro.setWordWrap(True)
         layout.addWidget(intro)

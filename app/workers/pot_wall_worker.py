@@ -5,14 +5,17 @@ import numpy as np
 
 from PySide6.QtCore import QObject, Signal
 
-from ..services.pot_wall_service import remove_pot_walls
+from ..services.pot_wall_service import (
+    estimate_pot_cylinder_geometry,
+    remove_pot_walls,
+)
 
 
 class PotWallWorker(QObject):
     """Run `remove_pot_walls` in a QThread. Emits the boolean mask."""
 
     progress = Signal(str)
-    finished = Signal(object)   # np.ndarray (D, H, W) bool
+    finished = Signal(object)   # (np.ndarray mask, PotCylinderGeometry|None)
     failed = Signal(str)
 
     def __init__(self, image: np.ndarray,
@@ -27,12 +30,13 @@ class PotWallWorker(QObject):
             self.progress.emit(
                 f"Pot-wall peel running  (xy={self.peel_xy_mm:.1f} mm, "
                 f"base={self.peel_base_mm:.1f} mm)…")
+            geom = estimate_pot_cylinder_geometry(self.image)
             interior = remove_pot_walls(
                 self.image,
                 peel_xy_mm=self.peel_xy_mm,
                 peel_base_mm=self.peel_base_mm,
             )
-            self.finished.emit(interior)
+            self.finished.emit((interior, geom))
         except Exception as e:
             traceback.print_exc()
             self.failed.emit(f"{type(e).__name__}: {e}")

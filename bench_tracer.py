@@ -1,8 +1,7 @@
-"""Micro-benchmark the fast tracer on a real volume.
+"""Micro-benchmark the fast tracer vs. the baseline, on real volume shapes.
 
-Usage:
-    python bench_tracer.py --image path/to/image.nii.gz \\
-                           --label path/to/label.nii.gz
+Run from repo root as:
+    python Vasrizo/bench_tracer.py
 """
 from __future__ import annotations
 import os, sys, time, argparse
@@ -18,11 +17,9 @@ from app.services.tracing_service import (
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--image", required=True,
-                    help="Path to a NIfTI image volume (.nii.gz)")
-    ap.add_argument("--label", required=True,
-                    help="Path to the matching binary label (.nii.gz)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--image", default="../B3T3_nifti_all_preprocessed/B3T3G10S1_0000.nii.gz")
+    ap.add_argument("--label", default="../Training_data_v3/B3T3_nifti_picked/B3T3G10S1.nii.gz")
     args = ap.parse_args()
 
     print("Loading…")

@@ -1,184 +1,194 @@
-"""Fast pot-wall removal — interactive replacement for offline pot cropping.
+"""Pot-wall removal based on a fitted cylindrical pot model.
 
-Rationale
----------
-A common preprocessing step for pot-grown root CT is, per axial slice,
-threshold → fill → ``binary_erosion(disk(R))``. With R ≈ 38 px, that
-erosion is O(N · R²) per slice and takes several minutes per volume.
+The user's requirement is intentionally *not* a generic 3D erosion:
 
-We replace the erosion with a **per-slice 2D Euclidean distance transform**.
-For each axial slice independently:
+1. Peel only the outer radial shell of the pot wall, i.e. the region
+   ``R in [R_max - outer_wall, R_max]`` around the fitted pot axis.
+2. Peel only the bottom slab of thickness ``outer_wall`` / ``base``
+   measured from the pot bottom toward the top.
+3. Do not peel the top horizontal slab near ``Y=0`` at all.
 
-  1. non_air_slice = image_slice > air_threshold  (outer wall + contents)
-  2. edt_mm = distance_transform_edt(non_air_slice, sampling=[dy, dx])
-  3. interior_slice = edt_mm ≥ peel_xy_mm
-
-EDT is O(N) per slice regardless of radius, and runs orders of magnitude
-faster than the equivalent binary erosion (tens of ms per 512² slice vs.
-seconds), giving ~2–5 s per full volume — fast enough to drive from a
-button rather than an offline batch.
-
-Rim-aware top preservation
---------------------------
-Per-slice 2D EDT on its own over-peels the plant shoot / root crown
-region above the pot rim: in those slices the only non-air material is
-a narrow shoot, every voxel of which is within peel_xy_mm of air, so
-the entire shoot would be thresholded away. We only want to peel the
-pot — the sides and the base — not the shoot.
-
-To avoid this, we identify the topmost slice whose 2D-EDT maximum
-exceeds peel_xy_mm (i.e. the last slice where the pot wall still
-bounds an interior wider than the peel). Every slice above that rim
-keeps its non-air voxels verbatim; no peel is applied there.
-
-The pot base (the frustum's flat bottom) is handled separately as an
-explicit axial crop.
+To do that we first estimate a cylindrical pot axis from the occupied
+volume itself, then build the mask analytically in cylindrical
+coordinates around that axis.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Optional
+
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 
 from ..utils.config import SPACING
 
 
-# Default air/outside threshold (HU). Anything below this is treated as
-# "outside the pot". −500 HU sits well below soil/water/root intensities
-# but comfortably above the −1000 HU of air, so the interface is stable
-# even in the presence of partial-volume haze around the pot wall.
 AIR_THRESHOLD_HU = -500.0
 
 
-def remove_pot_walls(image: np.ndarray,
-                     peel_xy_mm: float = 10.0,
-                     peel_base_mm: float = 0.0,
-                     base_axis: int = 2,
-                     base_is_low: bool = True,
-                     air_threshold: float = AIR_THRESHOLD_HU,
-                     spacing: Optional[np.ndarray] = None,
-                     ) -> np.ndarray:
-    """Return a boolean interior mask of the pot.
+@dataclass
+class PotCylinderGeometry:
+    """Estimated cylindrical pot geometry in physical mm coordinates."""
 
-    Parameters
-    ----------
-    image : (D, H, W) CT/MRI volume.
-    peel_xy_mm : how far (mm) to peel inward from the outer pot wall.
-        Value is a 3D Euclidean distance, so it also trims top/bottom
-        slices that are thinner than `peel_xy_mm` — but only to the same
-        depth they'd be trimmed by proximity to air, not to zero.
-    peel_base_mm : if > 0, additionally remove this many mm from the
-        pot base (the frustum's flat bottom). Applied AFTER the EDT peel,
-        so it's an explicit hard crop of the base region.
-    base_axis : which numpy axis runs vertically through the pot.
-        Default 2 matches the convention in this repo.
-    base_is_low : if True, the base of the pot is at the LOW index end of
-        `base_axis` (e.g. z=0 is the bottom). Flip to False if your data
-        is stored upside-down.
-    air_threshold : HU cutoff for "outside the pot".
-    spacing : (3,) voxel size in mm along each axis. Defaults to the
-        repo's SPACING constant.
+    base_axis: int
+    radial_axes: tuple[int, int]
+    center_mm: np.ndarray
+    radius_mm: float
+    y_min_index: int
+    y_max_index: int
+    axis_start_mm: np.ndarray
+    axis_end_mm: np.ndarray
 
-    Returns
-    -------
-    interior : (D, H, W) bool array — True inside the pot.
+
+def _slice_tuple(axis: int, idx: int, ndim: int = 3) -> tuple:
+    sl = [slice(None)] * ndim
+    sl[axis] = idx
+    return tuple(sl)
+
+
+def estimate_pot_cylinder_geometry(
+    image: np.ndarray,
+    base_axis: int = 1,
+    air_threshold: float = AIR_THRESHOLD_HU,
+    spacing: Optional[np.ndarray] = None,
+) -> Optional[PotCylinderGeometry]:
+    """Fit a pot axis and radius from the occupied part of the volume."""
+    if spacing is None:
+        spacing = SPACING
+    spacing = np.asarray(spacing, dtype=np.float64)
+
+    non_air = image > air_threshold
+    if not non_air.any():
+        return None
+
+    radial_axes = tuple(i for i in range(3) if i != base_axis)
+    live_y = non_air.any(axis=radial_axes)
+    live_idx = np.where(live_y)[0]
+    if len(live_idx) == 0:
+        return None
+
+    # Estimate the axis from the stable middle body of the pot rather than
+    # from the top rim or bottom cap, which are more likely to be irregular.
+    n_live = len(live_idx)
+    trim = int(max(1, round(n_live * 0.18)))
+    body_idx = live_idx[trim:-trim] if n_live > 2 * trim + 4 else live_idx
+
+    center_a = []
+    center_b = []
+    radii = []
+    for y_idx in body_idx:
+        sl = non_air[_slice_tuple(base_axis, int(y_idx), non_air.ndim)]
+        pts = np.argwhere(sl)
+        if len(pts) < 64:
+            continue
+        a_mm = pts[:, 0].astype(np.float64) * spacing[radial_axes[0]]
+        b_mm = pts[:, 1].astype(np.float64) * spacing[radial_axes[1]]
+        ca = 0.5 * (float(a_mm.min()) + float(a_mm.max()))
+        cb = 0.5 * (float(b_mm.min()) + float(b_mm.max()))
+        r = np.sqrt((a_mm - ca) ** 2 + (b_mm - cb) ** 2)
+        center_a.append(ca)
+        center_b.append(cb)
+        # Use a high quantile rather than the absolute max to avoid
+        # isolated outliers from shoots / roots skewing the fitted wall.
+        radii.append(float(np.quantile(r, 0.985)))
+
+    if not radii:
+        return None
+
+    center = np.zeros(3, dtype=np.float64)
+    center[radial_axes[0]] = float(np.median(center_a))
+    center[radial_axes[1]] = float(np.median(center_b))
+    center[base_axis] = 0.5 * float(
+        (live_idx[0] + live_idx[-1]) * spacing[base_axis]
+    )
+
+    radius_mm = float(np.quantile(np.asarray(radii, dtype=np.float64), 0.85))
+
+    axis_start = center.copy()
+    axis_end = center.copy()
+    axis_start[base_axis] = float(live_idx[0] * spacing[base_axis])
+    axis_end[base_axis] = float(live_idx[-1] * spacing[base_axis])
+
+    return PotCylinderGeometry(
+        base_axis=base_axis,
+        radial_axes=radial_axes,
+        center_mm=center,
+        radius_mm=radius_mm,
+        y_min_index=int(live_idx[0]),
+        y_max_index=int(live_idx[-1]),
+        axis_start_mm=axis_start,
+        axis_end_mm=axis_end,
+    )
+
+
+def remove_pot_walls(
+    image: np.ndarray,
+    peel_xy_mm: float = 15.0,
+    peel_base_mm: float = 0.0,
+    base_axis: int = 1,
+    base_is_low: bool = False,
+    air_threshold: float = AIR_THRESHOLD_HU,
+    spacing: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return a boolean interior mask after cylindrical wall / base peel.
+
+    This removes only:
+    - the radial shell near the fitted pot wall, and
+    - the bottom slab near the fitted pot base.
+
+    It does *not* remove a top slab near Y=0.
     """
     if spacing is None:
         spacing = SPACING
     spacing = np.asarray(spacing, dtype=np.float64)
 
-    # Step 1: non-air mask — everything that belongs to the pot or its
-    # contents. On raw CT this ALSO includes the plastic pot wall, which
-    # is exactly what we're about to peel off. On already-preprocessed
-    # volumes where the wall has been replaced with an out-of-window
-    # fill, this is identical to the interior and the peel is a no-op.
     non_air = image > air_threshold
     if not non_air.any():
         return non_air.copy()
 
-    # Step 2: per-slice 2D EDT along the two in-plane axes (the axes that
-    # aren't `base_axis`). Cheap and gives the correct behavior for the
-    # pot body — but naively applied it would *also* erase the shoot/
-    # crown region above the pot rim, because in those slices the only
-    # non-air material is a thin shoot whose every voxel sits within
-    # peel_xy_mm of air. We guard against that below with a rim-aware
-    # second pass.
-    in_plane_axes = tuple(i for i in range(3) if i != base_axis)
-    dy = spacing[in_plane_axes[0]]
-    dx = spacing[in_plane_axes[1]]
+    geom = estimate_pot_cylinder_geometry(
+        image=image,
+        base_axis=base_axis,
+        air_threshold=air_threshold,
+        spacing=spacing,
+    )
+    if geom is None:
+        return non_air.copy()
 
-    interior = np.zeros_like(non_air)
-    n_slices = non_air.shape[base_axis]
-    # Max 2D-EDT per slice. For pot-body slices this is roughly the pot's
-    # interior radius in mm; for shoot/crown slices above the rim it
-    # collapses to whatever half-thickness the shoot has — much smaller
-    # than peel_xy_mm, which is how we detect "above the rim".
-    slice_max_edt = np.zeros(n_slices, dtype=np.float64)
-    for z in range(n_slices):
-        # Index the slice along whichever axis is vertical
-        sl = [slice(None), slice(None), slice(None)]
-        sl[base_axis] = z
-        sl_t = tuple(sl)
+    radial_axes = geom.radial_axes
+    radial_shape = tuple(image.shape[ax] for ax in radial_axes)
+    coords_a = (
+        np.arange(radial_shape[0], dtype=np.float64) * spacing[radial_axes[0]]
+        - geom.center_mm[radial_axes[0]]
+    )
+    coords_b = (
+        np.arange(radial_shape[1], dtype=np.float64) * spacing[radial_axes[1]]
+        - geom.center_mm[radial_axes[1]]
+    )
+    grid_a, grid_b = np.meshgrid(coords_a, coords_b, indexing="ij")
+    radial_dist_mm = np.sqrt(grid_a ** 2 + grid_b ** 2)
+
+    inner_radius_mm = max(0.0, float(geom.radius_mm) - float(peel_xy_mm))
+    keep_radially = radial_dist_mm <= (inner_radius_mm + 1e-6)
+
+    interior = np.zeros_like(non_air, dtype=bool)
+    n_slices = image.shape[base_axis]
+    for y_idx in range(n_slices):
+        sl_t = _slice_tuple(base_axis, y_idx, non_air.ndim)
         slice_na = non_air[sl_t]
         if not slice_na.any():
             continue
-        # 2D anisotropic EDT — mm-accurate, independent of peel radius.
-        edt2d = distance_transform_edt(slice_na, sampling=(dy, dx))
-        slice_max_edt[z] = edt2d.max()
-        interior[sl_t] = edt2d >= peel_xy_mm
+        interior[sl_t] = slice_na & keep_radially
 
-    # Step 3: rim-aware top preservation. The top of the pot is open
-    # (plant shoot / root crown sticks out), and we do NOT want to peel
-    # the shoot the way we peel the pot wall. The highest slice whose
-    # 2D-EDT still exceeds peel_xy_mm is the pot rim: above it we only
-    # see the shoot, so we keep those slices' non-air content verbatim.
-    pot_body = slice_max_edt > peel_xy_mm
-    if pot_body.any():
-        body_idx = np.where(pot_body)[0]
-        if base_is_low:
-            # Base at low z → top is at high z. Keep everything above rim.
-            z_rim = int(body_idx.max())
-            if z_rim + 1 < n_slices:
-                sl = [slice(None), slice(None), slice(None)]
-                sl[base_axis] = slice(z_rim + 1, n_slices)
-                sl_t = tuple(sl)
-                interior[sl_t] = non_air[sl_t]
-        else:
-            # Base at high z → top is at low z. Keep everything below rim.
-            z_rim = int(body_idx.min())
-            if z_rim > 0:
-                sl = [slice(None), slice(None), slice(None)]
-                sl[base_axis] = slice(0, z_rim)
-                sl_t = tuple(sl)
-                interior[sl_t] = non_air[sl_t]
-
-    # Step 4: optional base crop. The pot's flat bottom is a different,
-    # asymmetric geometric feature from the side walls and isn't fully
-    # handled by radial peeling alone. Top is intentionally preserved
-    # above, so the base is the only direction still needing an axial
-    # trim. We measure relative to the actual interior (after the radial
-    # peel), not to the raw non-air — that way "peel 5 mm from the base"
-    # removes the bottom 5 mm of the pot floor even if the raw image
-    # contains extra air voxels below it.
     if peel_base_mm > 0:
-        n_trim = int(np.ceil(peel_base_mm / spacing[base_axis]))
+        n_trim = int(np.ceil(float(peel_base_mm) / spacing[base_axis]))
         if n_trim > 0:
-            axes_others = tuple(i for i in range(interior.ndim)
-                                if i != base_axis)
-            live_after_peel = interior.any(axis=axes_others)
-            live_idx = np.where(live_after_peel)[0]
-            if len(live_idx) > 0:
-                sl = [slice(None)] * interior.ndim
-                if base_is_low:
-                    z0 = int(live_idx[0])
-                    sl[base_axis] = slice(z0, z0 + n_trim)
-                else:
-                    z1 = int(live_idx[-1])
-                    sl[base_axis] = slice(max(0, z1 - n_trim + 1), z1 + 1)
-                interior[tuple(sl)] = False
+            sl = [slice(None)] * interior.ndim
+            if base_is_low:
+                y0 = geom.y_min_index
+                sl[base_axis] = slice(y0, min(n_slices, y0 + n_trim))
+            else:
+                y1 = geom.y_max_index
+                sl[base_axis] = slice(max(0, y1 - n_trim + 1), y1 + 1)
+            interior[tuple(sl)] = False
 
     return interior
-
-
-# TODO(pybind11): `distance_transform_edt` is already C-optimized, but the
-# non-air threshold + mask allocation could be fused in a single pass if
-# this ever becomes the long pole.

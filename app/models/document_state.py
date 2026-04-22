@@ -70,6 +70,9 @@ class DocumentState:
         self.screen_slice_freeze_direction: bool = False
         self.screen_slice_frozen_origin: Optional[np.ndarray] = None
         self.screen_slice_frozen_normal: Optional[np.ndarray] = None
+        self.y_slice_enabled: bool = False
+        self.y_slice_position_mm: float = 0.0
+        self.y_slice_reverse: bool = False
 
         # Annotation state
         self.waypoints: list[Waypoint] = []

@@ -17,6 +17,9 @@ class ControlsPanel(QWidget):
     clearPaths = Signal()
     save = Signal()
     resetView = Signal()
+    autoLockRootPlane = Signal()
+    cameraViewRequested = Signal(str)
+    turntableChanged = Signal(bool)
     # Noise deletion
     startDeletion = Signal()
     undoDeletion = Signal()
@@ -45,19 +48,20 @@ class ControlsPanel(QWidget):
         root.addWidget(vis_box)
 
         # --- Pot-wall peel ---
-        # Compute the interior mask live via per-slice 2D anisotropic
-        # EDT. Apply-on-click because even the fast version takes a few
-        # seconds on full volumes — too slow for live slider drag.
+        # Replaces the slow batch preprocess_imagesTr.py step: we compute
+        # the interior mask live via a 2D per-slice EDT. Apply-on-click
+        # because the EDT takes a few seconds on full volumes — too slow
+        # for live slider drag.
         pw_box = QGroupBox("Pot wall peel")
         pw_form = QFormLayout(pw_box)
         self.sp_peel_xy = QDoubleSpinBox()
         self.sp_peel_xy.setRange(0.0, 50.0)
         self.sp_peel_xy.setSingleStep(0.5)
-        self.sp_peel_xy.setValue(10.0)
+        self.sp_peel_xy.setValue(15.0)
         self.sp_peel_xy.setSuffix(" mm")
         self.sp_peel_xy.setToolTip(
             "Radial peel from the outer pot wall (2D per-slice EDT). "
-            "10 mm is a reasonable default for a typical growth pot.")
+            "15 mm is equivalent to the current batch preprocessing.")
         pw_form.addRow("Outer wall:", self.sp_peel_xy)
 
         self.sp_peel_base = QDoubleSpinBox()
@@ -95,18 +99,68 @@ class ControlsPanel(QWidget):
         self.btn_save.setStyleSheet(
             "QPushButton { padding: 6px; font-weight: bold; }")
         self.btn_reset_view = QPushButton("Reset view")
+        self.btn_auto_lock_plane = QPushButton("Auto fit root slab")
+        self.btn_auto_lock_plane.setToolTip(
+            "Use the current waypoints as hints and fit the current "
+            "screen-parallel front/back slab to the target root segment.")
         act_lay.addWidget(self.btn_trace)
         act_lay.addWidget(self.btn_undo_path)
         act_lay.addWidget(self.btn_clear)
         act_lay.addSpacing(4)
         act_lay.addWidget(self.btn_save)
+        act_lay.addWidget(self.btn_auto_lock_plane)
         act_lay.addWidget(self.btn_reset_view)
         self.btn_trace.clicked.connect(self.trace.emit)
         self.btn_undo_path.clicked.connect(self.undoPath.emit)
         self.btn_clear.clicked.connect(self.clearPaths.emit)
         self.btn_save.clicked.connect(self.save.emit)
+        self.btn_auto_lock_plane.clicked.connect(self.autoLockRootPlane.emit)
         self.btn_reset_view.clicked.connect(self.resetView.emit)
         root.addWidget(act_box)
+
+        cam_box = QGroupBox("Camera")
+        cam_lay = QVBoxLayout(cam_box)
+        cam_lay.addWidget(QLabel("Axis colors: X red, Y green, Z blue"))
+
+        row1 = QHBoxLayout()
+        self.btn_view_px = QPushButton("+X")
+        self.btn_view_nx = QPushButton("-X")
+        self.btn_view_py = QPushButton("+Y")
+        row1.addWidget(self.btn_view_px)
+        row1.addWidget(self.btn_view_nx)
+        row1.addWidget(self.btn_view_py)
+        cam_lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self.btn_view_ny = QPushButton("-Y")
+        self.btn_view_pz = QPushButton("+Z")
+        self.btn_view_nz = QPushButton("-Z")
+        row2.addWidget(self.btn_view_ny)
+        row2.addWidget(self.btn_view_pz)
+        row2.addWidget(self.btn_view_nz)
+        cam_lay.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        self.btn_view_iso = QPushButton("ISO")
+        row3.addWidget(self.btn_view_iso)
+        cam_lay.addLayout(row3)
+
+        self.cb_turntable = QCheckBox("Turntable orbit (left-drag)")
+        self.cb_turntable.setChecked(True)
+        self.cb_turntable.setToolTip(
+            "More stable orbiting than free trackball rotation. Keeps the "
+            "camera easier to understand relative to the axes.")
+        cam_lay.addWidget(self.cb_turntable)
+
+        self.btn_view_px.clicked.connect(lambda: self.cameraViewRequested.emit("+X"))
+        self.btn_view_nx.clicked.connect(lambda: self.cameraViewRequested.emit("-X"))
+        self.btn_view_py.clicked.connect(lambda: self.cameraViewRequested.emit("+Y"))
+        self.btn_view_ny.clicked.connect(lambda: self.cameraViewRequested.emit("-Y"))
+        self.btn_view_pz.clicked.connect(lambda: self.cameraViewRequested.emit("+Z"))
+        self.btn_view_nz.clicked.connect(lambda: self.cameraViewRequested.emit("-Z"))
+        self.btn_view_iso.clicked.connect(lambda: self.cameraViewRequested.emit("ISO"))
+        self.cb_turntable.toggled.connect(self.turntableChanged.emit)
+        root.addWidget(cam_box)
 
         # --- Noise deletion (CloudCompare-style segment tool) ---
         del_box = QGroupBox("Noise deletion")

@@ -35,6 +35,7 @@ from ..services.screen_projector import (
 COLOR_DELETION_PREVIEW = (1.0, 0.95, 0.2)
 COLOR_SLICE_GUIDE_PRIMARY = (0.15, 0.55, 0.95)
 COLOR_SLICE_GUIDE_SECONDARY = (0.95, 0.25, 0.25)
+COLOR_POT_AXIS = (0.0, 0.7, 0.95)
 
 
 class Viewer3D(QWidget):
@@ -89,12 +90,20 @@ class Viewer3D(QWidget):
         self._screen_slice_thickness_mm = 5.0
         self._screen_slice_show_guides = False
         self._screen_slice_plane_size = 100.0
+        self._y_slice_enabled = False
+        self._y_slice_position_mm = 0.0
+        self._y_slice_reverse = False
         self._camera_changed_cb: Optional[Callable[[], None]] = None
+        self._turntable_enabled = True
+        self._pot_axis_start: Optional[np.ndarray] = None
+        self._pot_axis_end: Optional[np.ndarray] = None
 
         if HAVE_PYVISTA:
             self._plotter = QtInteractor(self)
             self._plotter.set_background(COLOR_BG)
             layout.addWidget(self._plotter)
+            self._setup_orientation_axes()
+            self.set_turntable_interaction(True)
         else:
             from PySide6.QtWidgets import QLabel
             warn = QLabel(
@@ -199,9 +208,9 @@ class Viewer3D(QWidget):
         if len(coords) == 0:
             return coords
         if not self._screen_slice_enabled:
-            return coords
+            return self._filter_y_slice(coords)
         if self._screen_slice_origin is None or self._screen_slice_normal is None:
-            return coords
+            return self._filter_y_slice(coords)
         delta = np.asarray(coords, dtype=np.float64) - self._screen_slice_origin[None, :]
         signed = delta @ self._screen_slice_normal
         eps = 1e-6
@@ -213,6 +222,22 @@ class Viewer3D(QWidget):
             keep = signed >= -eps
             if self._screen_slice_locked:
                 keep &= signed <= float(self._screen_slice_thickness_mm) + eps
+        filtered = coords[keep]
+        return self._filter_y_slice(filtered)
+
+    def _filter_y_slice(self, coords: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if coords is None:
+            return None
+        if len(coords) == 0:
+            return coords
+        if not self._y_slice_enabled:
+            return coords
+        y = np.asarray(coords, dtype=np.float64)[:, 1]
+        eps = 1e-6
+        if self._y_slice_reverse:
+            keep = y <= (self._y_slice_position_mm + eps)
+        else:
+            keep = y >= (self._y_slice_position_mm - eps)
         return coords[keep]
 
     def _rebuild_label_cloud(self):
@@ -275,6 +300,48 @@ class Viewer3D(QWidget):
         self._rebuild_path_cloud()
         self._rebuild_waypoints()
         self._update_screen_slice_guides()
+
+    def set_pot_axis(self,
+                     start_mm: Optional[np.ndarray],
+                     end_mm: Optional[np.ndarray]):
+        self._pot_axis_start = (
+            np.asarray(start_mm, dtype=np.float64).copy()
+            if start_mm is not None else None
+        )
+        self._pot_axis_end = (
+            np.asarray(end_mm, dtype=np.float64).copy()
+            if end_mm is not None else None
+        )
+        self._rebuild_pot_axis()
+
+    def _rebuild_pot_axis(self):
+        self._clear_actor("pot_axis")
+        if self._plotter is None:
+            return
+        if self._pot_axis_start is None or self._pot_axis_end is None:
+            self._plotter.render()
+            return
+        if float(np.linalg.norm(self._pot_axis_end - self._pot_axis_start)) <= 1e-6:
+            self._plotter.render()
+            return
+        line = pv.Line(
+            self._pot_axis_start.astype(np.float32),
+            self._pot_axis_end.astype(np.float32),
+            resolution=1,
+        )
+        actor = self._plotter.add_mesh(
+            line,
+            color=COLOR_POT_AXIS,
+            line_width=5.0,
+            render_lines_as_tubes=True,
+            reset_camera=False,
+        )
+        try:
+            actor.SetPickable(False)
+        except Exception:
+            pass
+        self._actors["pot_axis"] = actor
+        self._plotter.render()
 
     # ------------------------------------------------------------------
     # Waypoints + traced paths
@@ -361,6 +428,12 @@ class Viewer3D(QWidget):
         self._screen_slice_plane_size = max(1.0, float(plane_size))
         self._rebuild_all_slice_filtered_clouds()
 
+    def set_y_slice(self, enabled: bool, position_mm: float, reverse: bool = False):
+        self._y_slice_enabled = bool(enabled)
+        self._y_slice_position_mm = float(position_mm)
+        self._y_slice_reverse = bool(reverse)
+        self._rebuild_all_slice_filtered_clouds()
+
     def current_camera_pose(self):
         if self._plotter is None:
             return None, None
@@ -371,6 +444,125 @@ class Viewer3D(QWidget):
         pos = np.asarray(camera.GetPosition(), dtype=np.float64)
         focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
         return pos, focal
+
+    def _setup_orientation_axes(self):
+        if self._plotter is None:
+            return
+        try:
+            axes = vtk.vtkAxesActor()
+            axes.SetXAxisLabelText("X")
+            axes.SetYAxisLabelText("Y")
+            axes.SetZAxisLabelText("Z")
+            axes.SetTotalLength(1.0, 1.0, 1.0)
+            widget = vtk.vtkOrientationMarkerWidget()
+            widget.SetOrientationMarker(axes)
+            iren_wrapper = getattr(self._plotter, "iren", None)
+            if iren_wrapper is not None and hasattr(iren_wrapper, "interactor"):
+                widget.SetInteractor(iren_wrapper.interactor)
+            else:
+                widget.SetInteractor(self._plotter.interactor)
+            widget.SetViewport(0.0, 0.0, 0.18, 0.18)
+            widget.SetEnabled(1)
+            widget.InteractiveOff()
+            self._axes_widget = widget
+            self._axes_actor = axes
+        except Exception:
+            self._axes_widget = None
+            self._axes_actor = None
+
+    def set_turntable_interaction(self, enabled: bool):
+        self._turntable_enabled = bool(enabled)
+        if self._plotter is None:
+            return
+        iren_wrapper = getattr(self._plotter, "iren", None)
+        if iren_wrapper is None:
+            return
+        try:
+            iren = iren_wrapper.interactor
+        except AttributeError:
+            iren = self._plotter.interactor
+        # Terrain style is what caused the repeated VTK "Resetting view-up"
+        # warnings near top/bottom views. We keep the interaction intuitive
+        # by using trackball in both modes and separately sanitizing view-up.
+        style = vtk.vtkInteractorStyleTrackballCamera()
+        iren.SetInteractorStyle(style)
+
+    def set_camera_to_axis(self, axis_name: str):
+        if self._plotter is None:
+            return
+        renderer = self._plotter.renderer
+        if renderer is None:
+            return
+        camera = renderer.GetActiveCamera()
+        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        pos = np.asarray(camera.GetPosition(), dtype=np.float64)
+        distance = float(np.linalg.norm(pos - focal))
+        if distance <= 1e-6:
+            distance = 200.0
+
+        axis_map = {
+            "+X": (np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            "-X": (np.array([-1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            "+Y": (np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            "-Y": (np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+            "+Z": (np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])),
+            "-Z": (np.array([0.0, 0.0, -1.0]), np.array([0.0, 1.0, 0.0])),
+        }
+        if axis_name == "ISO":
+            direction = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+            direction /= np.linalg.norm(direction)
+            view_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            direction, view_up = axis_map.get(
+                axis_name, (np.array([1.0, 1.0, 1.0]), np.array([0.0, 0.0, 1.0])))
+        new_pos = focal + distance * direction
+        camera.SetPosition(*new_pos.tolist())
+        camera.SetFocalPoint(*focal.tolist())
+        camera.SetViewUp(*view_up.tolist())
+        self._sanitize_camera_view_up(camera)
+        renderer.ResetCameraClippingRange()
+        self._plotter.render()
+        self._notify_camera_changed()
+
+    def align_camera_to_plane(self, center: np.ndarray, normal: np.ndarray,
+                              up_hint: Optional[np.ndarray] = None):
+        if self._plotter is None:
+            return
+        renderer = self._plotter.renderer
+        if renderer is None:
+            return
+        camera = renderer.GetActiveCamera()
+        center = np.asarray(center, dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        n_norm = float(np.linalg.norm(normal))
+        if n_norm <= 1e-8:
+            return
+        normal = normal / n_norm
+
+        cur_pos = np.asarray(camera.GetPosition(), dtype=np.float64)
+        cur_focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        distance = float(np.linalg.norm(cur_pos - cur_focal))
+        if distance <= 1e-6:
+            distance = 200.0
+
+        if up_hint is None:
+            up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            up_hint = np.asarray(up_hint, dtype=np.float64)
+        up_hint = up_hint - normal * float(np.dot(up_hint, normal))
+        if float(np.linalg.norm(up_hint)) <= 1e-8:
+            up_hint = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            up_hint = up_hint - normal * float(np.dot(up_hint, normal))
+        up_hint = up_hint / max(float(np.linalg.norm(up_hint)), 1e-8)
+
+        new_pos = center - distance * normal
+        camera.SetFocalPoint(*center.tolist())
+        camera.SetPosition(*new_pos.tolist())
+        camera.SetViewUp(*up_hint.tolist())
+        self._sanitize_camera_view_up(camera)
+        renderer.ResetCameraClippingRange()
+        self._plotter.render()
+        self._notify_camera_changed()
 
     def set_camera_changed_callback(self, callback: Optional[Callable[[], None]]):
         self._camera_changed_cb = callback
@@ -391,12 +583,43 @@ class Viewer3D(QWidget):
         self._camera_observer_installed = True
 
     def _notify_camera_changed(self):
+        if self._plotter is not None:
+            renderer = self._plotter.renderer
+            if renderer is not None:
+                self._sanitize_camera_view_up(renderer.GetActiveCamera())
         if self._camera_changed_cb is None:
             return
         try:
             self._camera_changed_cb()
         except Exception:
             pass
+
+    def _sanitize_camera_view_up(self, camera):
+        if camera is None:
+            return
+        pos = np.asarray(camera.GetPosition(), dtype=np.float64)
+        focal = np.asarray(camera.GetFocalPoint(), dtype=np.float64)
+        up = np.asarray(camera.GetViewUp(), dtype=np.float64)
+        view = focal - pos
+        view_norm = float(np.linalg.norm(view))
+        up_norm = float(np.linalg.norm(up))
+        if view_norm <= 1e-8 or up_norm <= 1e-8:
+            return
+        view /= view_norm
+        up /= up_norm
+        parallel = abs(float(np.dot(view, up)))
+        if parallel < 0.98:
+            return
+        for cand in (
+            np.array([0.0, 0.0, 1.0], dtype=np.float64),
+            np.array([0.0, 1.0, 0.0], dtype=np.float64),
+            np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        ):
+            cand = cand - view * float(np.dot(cand, view))
+            n = float(np.linalg.norm(cand))
+            if n > 1e-6:
+                camera.SetViewUp(*(cand / n).tolist())
+                return
 
     def _update_screen_slice_guides(self):
         self._clear_actor("slice_plane_primary")

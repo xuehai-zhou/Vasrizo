@@ -1,9 +1,8 @@
 """Build intensity-thresholded point clouds from an image volume.
 
 If an interior mask is supplied it is applied as an AND; if not, the
-threshold is applied to the image alone. When working with raw CT
-containing pot/container walls, use the in-app pot-wall peel to
-populate the interior mask first.
+threshold is applied to the image alone (the preprocessed image is
+expected to carry out-of-window fills for non-anatomy regions).
 """
 from __future__ import annotations
 from typing import Optional

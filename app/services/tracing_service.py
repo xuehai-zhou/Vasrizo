@@ -1,25 +1,27 @@
-"""Path-finding through the image volume (speed-field Dijkstra) + tube painting.
+"""Path-finding through raw CT (speed-field Dijkstra) + tube painting.
 
-Design notes
-------------
-  1. **Vectorized speed field.** A naive implementation calls
-     ``RootModel.speed_at()`` per voxel — ~700k Python calls for a 90^3
-     corridor on a 512^3 volume. We instead score the whole corridor
-     block in one numpy pass via a precomputed intensity LUT.
+Redesigned for speed after studying phase4_inward_tracking.py:
+
+  1. **Vectorized speed field.** The bottleneck in the original version was
+     a Python triple-loop calling RootModel.speed_at() per voxel (~700k
+     calls for a 90^3 corridor on a 512^3 volume). We now ask the
+     RootModel to score the entire corridor block in one numpy pass via
+     a precomputed intensity LUT.
 
   2. **Vectorized corridor mask.** The cylindrical corridor around the
-     start–end line is built with numpy broadcasting, not a nested loop.
+     start-end line is built with numpy broadcasting, not a nested loop.
 
-  3. **Anchor early-termination.** If the end waypoint is near an existing
-     label voxel, Dijkstra stops as soon as any goal-proximal voxel is
-     popped from the heap — typically an order-of-magnitude speedup over
-     running to convergence.
+  3. **Anchor early-termination.** If the end point is near an existing
+     label voxel, Dijkstra can stop as soon as any goal-proximal voxel
+     is popped from the heap — phase4's finished-paths KDTree trick,
+     adapted to our two-waypoint scenario.
 
-  4. **Optional numba Dijkstra.** For volumes where the Python heap is
-     still the long pole, a numba-JIT'd variant kicks in when ``numba``
-     is installed. Degrades gracefully to the pure-Python heap otherwise.
+  4. **Optional numba Dijkstra.** For volumes where Python-heap Dijkstra
+     is still the long pole, a numba-JIT'd variant kicks in when numba
+     is installed. Degrades gracefully to the pure-python heap otherwise.
 
-Interface (`find_path_between`, `paint_tube`) is unchanged across backends.
+Interface (`find_path_between`, `paint_tube`) is unchanged so the rest of
+the app doesn't need to care which backend is used.
 """
 from __future__ import annotations
 import heapq
@@ -42,7 +44,7 @@ except ImportError:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Corridor mask and speed field (vectorized)
+# Corridor mask and speed field (vectorized, phase4-inspired)
 # ---------------------------------------------------------------------------
 
 def _build_corridor_mask(shape: tuple,
@@ -123,8 +125,7 @@ def _dijkstra_python(speed_field: np.ndarray,
                      goal_proximity_mask: Optional[np.ndarray] = None
                      ) -> Optional[np.ndarray]:
     """Pure-Python heap Dijkstra. Early-terminates if we reach any voxel in
-    `goal_proximity_mask` (if provided) — the anchor early-termination
-    trick described in the module docstring."""
+    `goal_proximity_mask` (if provided) — anchor trick from phase4."""
     shape = speed_field.shape
     INF = float('inf')
     dist_map = np.full(shape, INF, dtype=np.float32)
@@ -338,8 +339,7 @@ def find_path_between(image: np.ndarray, model: RootModel,
     progress : optional callable(msg:str) for UI status updates
     label  : (D, H, W) bool label volume, optional. If supplied, the
              Dijkstra may terminate at any labeled voxel within
-             `goal_radius` of `end_vox` — the anchor early-termination
-             trick described in the module docstring.
+             `goal_radius` of `end_vox` — the phase4 anchor trick.
     goal_radius : int, proximity radius (vx) for early termination.
     """
     start = np.asarray(start_vox, dtype=np.int64)

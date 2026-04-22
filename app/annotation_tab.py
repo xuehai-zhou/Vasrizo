@@ -20,9 +20,11 @@ from .io.data_loader import SampleData
 from .services.root_model import RootModel
 from .services.tracing_service import paint_tube, paint_tube_local
 from .services.threshold_service import threshold_ct_to_coords
+from .services.root_plane_service import estimate_root_screen_slab
+from .services.pot_wall_service import estimate_pot_cylinder_geometry
 from .utils.config import (
     SPACING, HU_LOWER_DEFAULT, HU_UPPER_DEFAULT, HU_STEP,
-    HU_MIN_LIMIT, HU_MAX_LIMIT, POINT_SIZE_DEFAULT,
+    HU_MIN_LIMIT, HU_MAX_LIMIT, POINT_SIZE_DEFAULT, CT_DOWNSAMPLE_DEFAULT,
 )
 from .utils.geometry_utils import label_to_coords, voxel_to_physical
 
@@ -30,6 +32,7 @@ from .ui.viewer_3d import Viewer3D
 from .ui.threshold_range_slider import ThresholdRangeSlider
 from .ui.point_size_slider import PointSizeSlider
 from .ui.screen_slice_slider import ScreenSliceSlider
+from .ui.axis_slice_slider import AxisSliceSlider
 from .ui.controls_panel import ControlsPanel
 from .ui.waypoint_panel import WaypointPanel
 from .services.deletion_service import build_voxel_deletion_mask
@@ -69,6 +72,7 @@ class AnnotationTab(QWidget):
         self._save_worker: Optional[SaveWorker] = None
         self._potwall_thread: Optional[QThread] = None
         self._potwall_worker = None
+        self._pot_geometry = None
 
         self._build_ui()
         self._start_loading()
@@ -119,6 +123,16 @@ class AnnotationTab(QWidget):
             minimum=-100, maximum=100, initial=0.0)
         slice_lay.addWidget(self.screen_slice_slider)
         center_lay.addWidget(slice_box)
+
+        yslice_box = QFrame()
+        yslice_box.setFrameShape(QFrame.StyledPanel)
+        yslice_lay = QVBoxLayout(yslice_box)
+        yslice_lay.setContentsMargins(0, 0, 0, 0)
+        self.y_slice_slider = AxisSliceSlider(
+            title="Y slice (planes parallel to XZ)", minimum=-100,
+            maximum=100, initial=0.0)
+        yslice_lay.addWidget(self.y_slice_slider)
+        center_lay.addWidget(yslice_box)
 
         # Threshold control row
         thr_box = QFrame()
@@ -175,6 +189,9 @@ class AnnotationTab(QWidget):
         self.controls.clearPaths.connect(self._on_clear_paths)
         self.controls.save.connect(self._on_save)
         self.controls.resetView.connect(lambda: self.viewer.reset_view())
+        self.controls.autoLockRootPlane.connect(self._on_auto_fit_root_slab)
+        self.controls.cameraViewRequested.connect(self._on_camera_view_requested)
+        self.controls.turntableChanged.connect(self.viewer.set_turntable_interaction)
         self.controls.fillRadiusChanged.connect(self._on_radius_changed)
         self.controls.betaChanged.connect(self._on_beta_changed)
         self.controls.startDeletion.connect(self._on_start_deletion)
@@ -200,6 +217,9 @@ class AnnotationTab(QWidget):
             self._on_screen_slice_guides_changed)
         self.screen_slice_slider.freezeDirectionChanged.connect(
             self._on_screen_slice_freeze_direction_changed)
+        self.y_slice_slider.enabledChanged.connect(self._on_y_slice_enabled_changed)
+        self.y_slice_slider.positionChanged.connect(self._on_y_slice_position_changed)
+        self.y_slice_slider.reverseChanged.connect(self._on_y_slice_reverse_changed)
 
         # Live values label
         self._refresh_thr_label(*self.slider.values())
@@ -254,6 +274,9 @@ class AnnotationTab(QWidget):
             self.doc.screen_slice_show_guides)
         self.screen_slice_slider.set_freeze_direction(
             self.doc.screen_slice_freeze_direction)
+        self.y_slice_slider.set_enabled(self.doc.y_slice_enabled)
+        self.y_slice_slider.set_position(self.doc.y_slice_position_mm, emit=False)
+        self.y_slice_slider.set_reverse(self.doc.y_slice_reverse)
         self.viewer.set_point_size(self.doc.point_size)
 
         # Initial cloud rendering
@@ -261,8 +284,10 @@ class AnnotationTab(QWidget):
         self._refresh_ct_cloud()
         self._refresh_waypoints()
         self._refresh_paths()
+        self._refresh_pot_axis_overlay()
         self.viewer.reset_view()
         self._sync_screen_slice_to_camera(force_range=True)
+        self._sync_y_slice()
 
         # Enable picking
         self.viewer.pointPicked.connect(self._on_point_picked)
@@ -284,10 +309,9 @@ class AnnotationTab(QWidget):
         self.viewer.set_label_points(coords, visible=self.doc.show_label)
 
     def _refresh_ct_cloud(self):
-        """Threshold overlay is computed directly from the image volume.
+        """Threshold overlay is computed directly from the (preprocessed) image.
 
-        If the pot-wall peel has populated `sample.interior_mask`, it is
-        AND-ed into the threshold result so pot walls are suppressed.
+        An optional interior mask is applied if the sample carried one.
         """
         if self.doc is None:
             return
@@ -308,7 +332,7 @@ class AnnotationTab(QWidget):
             interior=self.doc.sample.interior_mask,  # None is fine
             hu_lower=self.doc.hu_lower,
             hu_upper=self.doc.hu_upper,
-            downsample=1,
+            downsample=CT_DOWNSAMPLE_DEFAULT,
         )
         self._thr_worker.moveToThread(self._thr_thread)
         self._thr_thread.started.connect(self._thr_worker.run)
@@ -336,6 +360,18 @@ class AnnotationTab(QWidget):
         for tp in self.doc.traced_paths:
             phys_paths.append(voxel_to_physical(tp.path_voxels))
         self.viewer.update_traced_paths(phys_paths)
+
+    def _refresh_pot_axis_overlay(self):
+        if self.doc is None or self.doc.sample.image is None:
+            self._pot_geometry = None
+            self.viewer.set_pot_axis(None, None)
+            return
+        geom = estimate_pot_cylinder_geometry(self.doc.sample.image)
+        self._pot_geometry = geom
+        if geom is None:
+            self.viewer.set_pot_axis(None, None)
+            return
+        self.viewer.set_pot_axis(geom.axis_start_mm, geom.axis_end_mm)
 
     # ------------------------------------------------------------------
     # Threshold slider
@@ -429,6 +465,29 @@ class AnnotationTab(QWidget):
         self.doc.show_ct = on
         self.viewer.set_ct_visible(on)
 
+    def _on_y_slice_enabled_changed(self, enabled: bool):
+        if self.doc is None:
+            return
+        self.doc.y_slice_enabled = bool(enabled)
+        self.y_slice_slider.set_enabled(enabled)
+        self._sync_y_slice()
+
+    def _on_y_slice_position_changed(self, position_mm: float):
+        if self.doc is None:
+            return
+        self.doc.y_slice_position_mm = float(position_mm)
+        self._sync_y_slice()
+
+    def _on_y_slice_reverse_changed(self, enabled: bool):
+        if self.doc is None:
+            return
+        self.doc.y_slice_reverse = bool(enabled)
+        self._sync_y_slice()
+
+    def _on_camera_view_requested(self, axis_name: str):
+        self.viewer.set_camera_to_axis(axis_name)
+        self.statusMessage.emit(f"Camera snapped to {axis_name} view.")
+
     def _on_camera_changed(self):
         if self.doc is None or not self.doc.screen_slice_enabled:
             return
@@ -448,6 +507,21 @@ class AnnotationTab(QWidget):
                     corners.append((x, y, z))
         return voxel_to_physical(np.asarray(corners, dtype=np.float64))
 
+    def _sync_y_slice(self):
+        if self.doc is None:
+            return
+        corners = self._volume_corners_phys()
+        if len(corners) > 0:
+            ys = corners[:, 1]
+            pad = max(5.0, 0.05 * float(ys.max() - ys.min()))
+            self.y_slice_slider.set_range(float(np.floor(ys.min() - pad)),
+                                          float(np.ceil(ys.max() + pad)))
+        self.viewer.set_y_slice(
+            enabled=self.doc.y_slice_enabled,
+            position_mm=self.doc.y_slice_position_mm,
+            reverse=self.doc.y_slice_reverse,
+        )
+
     def _current_view_frame(self):
         pos, focal = self.viewer.current_camera_pose()
         if pos is None or focal is None:
@@ -466,6 +540,72 @@ class AnnotationTab(QWidget):
             return
         self.doc.screen_slice_frozen_origin = origin.copy()
         self.doc.screen_slice_frozen_normal = normal.copy()
+
+    def _root_plane_support_label_points(self) -> np.ndarray:
+        if self.doc is None:
+            return np.empty((0, 3), dtype=np.float64)
+        return label_to_coords(self.doc.label, downsample=1)
+
+    def _root_plane_support_ct_points(self) -> np.ndarray:
+        pts = getattr(self.viewer, "_cloud_raw", {}).get("ct")
+        if pts is None:
+            return np.empty((0, 3), dtype=np.float64)
+        return np.asarray(pts, dtype=np.float64)
+
+    def _on_auto_fit_root_slab(self):
+        if self.doc is None:
+            return
+        if len(self.doc.waypoints) < 2:
+            QMessageBox.information(
+                self, "Need waypoints",
+                "Pick at least 2 waypoints along the target root before "
+                "using Auto fit root slab.")
+            return
+
+        waypoints_phys = [wp.phys for wp in self.doc.waypoints]
+        view_origin, view_normal = self._current_view_frame()
+        if view_origin is None or view_normal is None:
+            QMessageBox.warning(
+                self, "Auto fit failed",
+                "Current view frame is unavailable.")
+            return
+        try:
+            est = estimate_root_screen_slab(
+                waypoints_phys=waypoints_phys,
+                label_points=self._root_plane_support_label_points(),
+                ct_points=self._root_plane_support_ct_points(),
+                image_volume=self.doc.sample.image,
+                view_origin=view_origin,
+                view_normal=view_normal,
+                corridor_radius_mm=max(6.0, 10.0 * self.doc.fill_radius_mm),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Auto fit failed", str(exc))
+            self.statusMessage.emit(f"Auto fit failed: {exc}")
+            return
+
+        self.doc.screen_slice_enabled = True
+        self.doc.screen_slice_freeze_direction = True
+        self.doc.screen_slice_frozen_origin = est.slab_origin.copy()
+        self.doc.screen_slice_frozen_normal = est.slab_normal.copy()
+        self.doc.screen_slice_reverse = False
+        self.doc.screen_slice_locked = True
+        self.doc.screen_slice_show_guides = True
+        self.doc.screen_slice_thickness_mm = float(est.thickness_mm)
+        self.doc.screen_slice_offset_mm = float(est.offset_mm)
+
+        self.screen_slice_slider.set_enabled(True)
+        self.screen_slice_slider.set_freeze_direction(True)
+        self.screen_slice_slider.set_reverse(False)
+        self.screen_slice_slider.set_locked(True)
+        self.screen_slice_slider.set_guides(True)
+        self.screen_slice_slider.set_thickness(self.doc.screen_slice_thickness_mm)
+        self.screen_slice_slider.set_offset(self.doc.screen_slice_offset_mm, emit=False)
+        self._sync_screen_slice_to_camera(force_range=True)
+        self.statusMessage.emit(
+            f"Auto-fit root slab from {est.support_points} {est.support_source} "
+            f"points; planes parallel to pot axis and root trend, "
+            f"thickness {est.thickness_mm:.1f} mm.")
 
     def _sync_screen_slice_to_camera(self, force_range: bool):
         if self.doc is None:
@@ -583,9 +723,9 @@ class AnnotationTab(QWidget):
             waypoints_phys=waypoints_phys,
             fill_radius_mm=self.doc.fill_radius_mm,
             mean_spacing=float(np.mean(SPACING)),
-            # Enables the anchor early-termination trick: Dijkstra stops
-            # as soon as it reaches a labeled voxel near the end
-            # waypoint (see services/tracing_service.py for details).
+            # Enables the early-termination anchor trick (migrated idea
+            # from phase4_inward_tracking): Dijkstra stops as soon as it
+            # reaches a labeled voxel near the end waypoint.
             label=self.doc.label,
         )
         self._trace_worker.moveToThread(self._trace_thread)
@@ -871,12 +1011,12 @@ class AnnotationTab(QWidget):
         self.statusMessage.emit(f"Restored {n:,} voxels from last deletion.")
 
     # ------------------------------------------------------------------
-    # Pot-wall peel
+    # Pot-wall peel (live replacement for preprocess_imagesTr.py)
     #
-    # Runs per-slice 2D anisotropic EDT with rim-aware top preservation
-    # (see services/pot_wall_service.py). We run it in a worker since it
-    # still takes a few seconds on a full volume; on completion we swap
-    # the resulting interior mask into DocumentState and re-fire the
+    # The heavy 2D binary_erosion(disk(38)) step in the batch script is
+    # replaced with per-slice 2D EDT. We run it in a worker since even
+    # the fast version is a few seconds on a full-volume, then swap the
+    # resulting interior mask into the DocumentState and re-fire the
     # thresholded-CT overlay worker so the 3D view reflects the new peel.
     # ------------------------------------------------------------------
 
@@ -909,20 +1049,28 @@ class AnnotationTab(QWidget):
         self._potwall_worker.failed.connect(self._potwall_thread.quit)
         self._potwall_thread.start()
 
-    def _on_pot_wall_done(self, interior_mask):
+    def _on_pot_wall_done(self, payload):
         try:
             self.controls.btn_apply_pot_wall.setEnabled(True)
         except AttributeError:
             pass
         if self.doc is None:
             return
+        interior_mask, geom = payload
         # Store the fresh mask on the sample so the threshold overlay
         # worker uses it. Fire a cloud refresh.
         self.doc.sample.interior_mask = np.ascontiguousarray(
             interior_mask.astype(np.uint8))
+        self._pot_geometry = geom
+        if geom is not None:
+            self.viewer.set_pot_axis(geom.axis_start_mm, geom.axis_end_mm)
+            extra = f", R={geom.radius_mm:.1f} mm around fitted center axis"
+        else:
+            self.viewer.set_pot_axis(None, None)
+            extra = ""
         n_in = int(interior_mask.sum())
         self.statusMessage.emit(
-            f"Pot-wall peel done — interior = {n_in:,} voxels. "
+            f"Pot-wall peel done — interior = {n_in:,} voxels{extra}. "
             "Updating threshold overlay…")
         self._refresh_ct_cloud()
 

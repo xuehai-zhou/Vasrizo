@@ -1,5 +1,6 @@
 """Rootrak-style learned root appearance model.
 
+Ported unchanged from interactive_gap_tool_B3T3.py::RootModel.
 Pure-Python, no Qt. Safe to call from background workers.
 
 Two evaluation paths:
@@ -21,13 +22,26 @@ from skimage.morphology import ball
 class RootModel:
     """Learns p_root from labelled voxels; evaluates speed(voxel) via JS divergence."""
 
+    _SHELL_SELEM = ball(3)
+
     def __init__(self, image: np.ndarray, label: np.ndarray,
                  n_bins: int = 256, kde_bw: float = 2.0,
-                 col_diff: float = 80.0, beta: float = 0.40):
-        root_vals = image[label]
-        se = ball(3)
-        shell = binary_dilation(label, se) & ~label
-        bg_vals = image[shell]
+                 col_diff: float = 80.0, beta: float = 0.40,
+                 max_root_samples: int = 250_000,
+                 max_bg_samples: int = 250_000):
+        root_vals, bg_vals = self._training_samples(
+            image=image,
+            label=label,
+            max_root_samples=max_root_samples,
+            max_bg_samples=max_bg_samples,
+        )
+        if len(root_vals) == 0:
+            raise ValueError("RootModel: label contains no positive voxels.")
+        if len(bg_vals) == 0:
+            bg_vals = image[~label]
+            if len(bg_vals) > max_bg_samples:
+                idx = np.linspace(0, len(bg_vals) - 1, max_bg_samples, dtype=np.int64)
+                bg_vals = bg_vals[idx]
 
         # Intensity bounds from labels
         self.b_lower = float(np.percentile(root_vals, 2))
@@ -61,6 +75,38 @@ class RootModel:
                            (self.p_root + self.p_bg + 1e-12)).astype(np.float32)
         self._hist_min = float(self.hist_min)
         self._hist_range = float(self.hist_max - self.hist_min)
+
+    @classmethod
+    def _training_samples(cls, image: np.ndarray, label: np.ndarray,
+                          max_root_samples: int,
+                          max_bg_samples: int) -> tuple[np.ndarray, np.ndarray]:
+        """Collect representative root / shell intensities cheaply."""
+        label = np.asarray(label, dtype=bool)
+        root_idx = np.argwhere(label)
+        if len(root_idx) == 0:
+            return np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.float32)
+
+        margin = np.array(cls._SHELL_SELEM.shape) // 2 + 1
+        mins = np.maximum(root_idx.min(axis=0) - margin, 0)
+        maxs = np.minimum(root_idx.max(axis=0) + margin + 1, np.array(label.shape))
+        bbox = tuple(slice(int(lo), int(hi)) for lo, hi in zip(mins, maxs))
+
+        label_crop = label[bbox]
+        image_crop = image[bbox]
+        shell_crop = binary_dilation(label_crop, cls._SHELL_SELEM) & ~label_crop
+
+        root_vals = image_crop[label_crop]
+        bg_vals = image_crop[shell_crop]
+
+        if len(root_vals) > max_root_samples:
+            idx = np.linspace(0, len(root_vals) - 1, max_root_samples, dtype=np.int64)
+            root_vals = root_vals[idx]
+        if len(bg_vals) > max_bg_samples:
+            idx = np.linspace(0, len(bg_vals) - 1, max_bg_samples, dtype=np.int64)
+            bg_vals = bg_vals[idx]
+
+        return (np.asarray(root_vals, dtype=np.float32),
+                np.asarray(bg_vals, dtype=np.float32))
 
     @staticmethod
     def _kde_smooth(hist: np.ndarray, sigma: float) -> np.ndarray:

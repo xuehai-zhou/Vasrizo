@@ -3,10 +3,11 @@
 Contract per sample:
     {images_dir}/{name}.nii.gz         OR  {images_dir}/{name}_0000.nii.gz
     {labels_dir}/{name}.nii.gz
+    {images_dir}/{name}_interior.nii.gz  — OPTIONAL, auto-detected if present
 
-The image volume can be raw or preprocessed. If raw CT contains a pot
-or container wall, `SampleData.interior_mask` is populated live by the
-in-app pot-wall peel (see services/pot_wall_service.py).
+The image volume can be raw or preprocessed; pot-wall removal happens
+interactively inside Vasrizo. An interior mask next to the image is
+honored when supplied, but the app works without it.
 """
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
@@ -20,20 +21,17 @@ import numpy as np
 
 # Accepted image filename suffixes (tried in order).
 IMAGE_SUFFIXES = ("_0000.nii.gz", ".nii.gz")
+INTERIOR_SUFFIX = "_interior.nii.gz"
 
 
 @dataclass
 class SampleData:
-    """In-memory payload for one sample.
-
-    `interior_mask` starts as None and gets populated at runtime by the
-    "Apply pot-wall peel" action when the user needs it.
-    """
+    """In-memory payload for one sample."""
     name: str
-    image: np.ndarray              # float32 image volume
+    image: np.ndarray              # float32 preprocessed volume
     label: np.ndarray              # bool label volume
     lbl_nii: nib.Nifti1Image       # for saving with matching affine/header
-    interior_mask: Optional[np.ndarray] = None  # uint8 0/1, populated live
+    interior_mask: Optional[np.ndarray] = None  # uint8 0/1 if present
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +47,19 @@ def _image_path(images_dir: str, name: str) -> Optional[str]:
     return None
 
 
+def _interior_path(images_dir: str, name: str) -> Optional[str]:
+    p = os.path.join(images_dir, f"{name}{INTERIOR_SUFFIX}")
+    return p if os.path.exists(p) else None
+
+
 def _image_names_in_dir(images_dir: str) -> set[str]:
     """Set of sample names discovered in `images_dir` (either suffix)."""
     if not os.path.isdir(images_dir):
         return set()
     names: set[str] = set()
     for f in os.listdir(images_dir):
+        if f.endswith(INTERIOR_SUFFIX):
+            continue
         for suffix in IMAGE_SUFFIXES:
             if f.endswith(suffix):
                 names.add(f[: -len(suffix)])
@@ -101,6 +106,10 @@ def load_sample(name: str, labels_dir: str, images_dir: str) -> SampleData:
     Image and label are decoded concurrently because zlib releases the GIL
     during inflate — a 10-20% wall-clock win over the sequential path on
     the typical CT+mask pair, and more when the label is sizeable.
+
+    The optional interior mask at `{images_dir}/{name}_interior.nii.gz` is
+    picked up automatically; if absent, the sample is loaded without one
+    and the pot-wall peel can be applied interactively to compute it.
     """
     img_path = _image_path(images_dir, name)
     if img_path is None:
@@ -121,7 +130,16 @@ def load_sample(name: str, labels_dir: str, images_dir: str) -> SampleData:
         image = f_image.result()
         label = f_label.result()
 
+    interior_mask = None
+    int_path = _interior_path(images_dir, name)
+    if int_path is not None:
+        try:
+            interior_mask = np.asarray(nib.load(int_path).dataobj,
+                                       dtype=np.uint8)
+        except Exception:
+            interior_mask = None
+
     return SampleData(
         name=name, image=image, label=label, lbl_nii=lbl_nii,
-        interior_mask=None,
+        interior_mask=interior_mask,
     )

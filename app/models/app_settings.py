@@ -1,8 +1,9 @@
 """App-wide settings carried from CLI args into all tabs.
 
-Three directories per run:
+Two required directories per run:
     labels_dir  — partial/broken labels per sample
-    images_dir  — image volumes per sample (raw or preprocessed)
+    images_dir  — preprocessed image volumes per sample
+                  (non-anatomy voxels filled with an out-of-range intensity)
     output_dir  — refined labels are saved here
 
 Directories can be:

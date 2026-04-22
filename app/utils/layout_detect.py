@@ -12,11 +12,14 @@ from typing import Optional
 IMAGE_CANDIDATES = (
     "images", "imagesTr", "imagesTs", "image", "img", "imgs",
     "volumes", "raw", "ct", "mri",
+    # Root-CT specific defaults used by this repo
+    "B3T3_nifti_all_preprocessed", "B3T3_nifti_all",
 )
 
 LABEL_CANDIDATES = (
     "labels", "labelsTr", "labelsTs", "label", "masks", "seg",
     "segmentation", "segmentations", "annot", "annotations",
+    "B3T3_nifti_picked", "labelsCompleteNi_v1",
 )
 
 
@@ -25,8 +28,8 @@ def _first_existing(root: str, names: tuple) -> Optional[str]:
         p = os.path.join(root, n)
         if os.path.isdir(p):
             return os.path.abspath(p)
-    # Also check one level deep — some datasets have layouts like
-    # root/dataset_name/images/ rather than root/images/.
+    # Also check nested: some datasets are root/Training_data/images/
+    # (one level deep)
     try:
         entries = os.listdir(root)
     except OSError:
