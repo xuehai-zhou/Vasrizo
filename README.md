@@ -117,8 +117,6 @@ Vasrizo/
 ## Notes
 
 - `v2.0.0` is focused on interactive root CT cleanup and inspection.
-- The repository should contain only the current app code, not nested
-  historical `V12/V13/...` folders.
 - For very large CT volumes, increasing display downsampling can make the
   viewer much smoother.
 
